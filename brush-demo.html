@@ -108,6 +108,12 @@
   .chip small{font-family:"JetBrains Mono",monospace;font-size:8.5px;color:var(--txt-dim);letter-spacing:.05em;margin-left:6px}
   .note{font-size:10px;color:var(--txt-dim);line-height:1.6;margin-top:6px}
   .note b{color:var(--teal);font-weight:400}
+  .group input[type=text]{
+    flex:1;min-width:0;background:transparent;border:1px solid var(--line);
+    color:var(--washi);font-family:"Shippori Mincho",serif;font-size:16px;
+    padding:7px 10px;border-radius:2px;outline:none;transition:border-color .15s;
+  }
+  .group input[type=text]:focus{border-color:var(--amber)}
   .swatches{display:flex;gap:8px}
   .sw{width:26px;height:26px;border-radius:50%;border:2px solid transparent;cursor:pointer;transition:.15s}
   .sw.on{border-color:var(--washi)}
@@ -157,6 +163,16 @@
     </div>
 
     <div class="group">
+      <div class="gh">運筆再生 · watch it written</div>
+      <div class="row" style="margin-bottom:10px">
+        <input id="animText" type="text" value="永" maxlength="8" placeholder="字 — e.g. 永 or 日本" autocomplete="off" spellcheck="false">
+        <button id="btnWrite" style="flex:0 0 auto">▶ 書く</button>
+      </div>
+      <div class="ctl"><label><span><span class="ja">速さ</span> <span class="en">playback</span></span><span class="val" id="vAspeed"></span></label><input type="range" id="aspeed" min="0.3" max="2.5" step="0.05" value="1"></div>
+      <div class="note" id="animNote">The brush writes the characters itself, in correct stroke order — medians from <b>animCJK</b>, per-stroke endings from KanjiVG. Up to 4 characters, laid out 縦書き. Needs the page served over http for the data files.</div>
+    </div>
+
+    <div class="group">
       <div class="gh">紙 · the paper</div>
       <div class="row" style="margin-bottom:8px">
         <button id="undo">↶ 戻す undo</button>
@@ -197,6 +213,7 @@
   bind('inkload','ink',   v=>Math.round(v*100)+'%');
   bind('kasure','kasure', v=>Math.round(v*100)+'%');
   bind('bleed','bleed',   v=>Math.round(v*100)+'%');
+  bind('aspeed','aspeed', v=>v.toFixed(2)+'×');
 
   // ink tones
   const TONES = ['#141013','#3a2f2a','#20323a','#3a2030','#1a2b1a'];
@@ -316,11 +333,15 @@
   const clamp = (v,a,b)=>v<a?a:v>b?b:v;
   const smoothstep = t => { t=clamp(t,0,1); return t*t*(3-2*t); };
 
+  // brush size in css px — the auto-writer overrides it to fit its cells
+  let sizeOverride = null;
+  const brushSize = () => sizeOverride ?? P.size;
+
   // half-width the brush wants at a sample, from stroke size, pressure & speed.
   // Real kaisho has dramatic 提按 thick-thin: dwelling presses the tuft open
   // (>1x), a fast sweep rides the tip (~0.15x).
   function halfWidthAt(pt, speed){
-    const s = P.size*DPR*0.5;
+    const s = brushSize()*DPR*0.5;
     const speedFactor = clamp(1.18 - speed*0.34, 0.14, 1.18);
     const press = pt.p>0 ? (0.35 + pt.p*1.0) : 1;
     return Math.max(0.5, s*speedFactor*press);
@@ -328,6 +349,7 @@
 
   function start(e){
     e.preventDefault();
+    cancelAutoWrite();               // taking the brush interrupts the writer
     hint.style.opacity = 0;
     wet.setPointerCapture?.(e.pointerId);
     pushUndo();
@@ -381,7 +403,7 @@
       const a=src[Math.max(0,i-1)], b=src[i];
       const dist=Math.hypot(b.x-a.x,b.y-a.y);
       const dt=Math.max(1,(b.t||0)-(a.t||0));
-      const v=i===0?0:dist/dt;
+      const v=i===0?0:dist/dt/DPR;   // css px/ms, so feel is DPR-independent
       spd.push(v);
       rw.push(halfWidthAt(b, v));
     }
@@ -417,7 +439,7 @@
   function applyTapers(spine, lift){
     if(spine.length<2) return;
     const total=spine[spine.length-1].d;
-    const base=P.size*DPR;
+    const base=brushSize()*DPR;
     const headLen=clamp(base*0.55, 4*DPR, total*0.35);
     const tailLen=clamp(base*(0.5+lift*2.4), 6*DPR, total*0.78);
     const tailFloor=(1-lift)*0.92;             // tome keeps its width, harai -> 0
@@ -711,9 +733,166 @@
     b.addEventListener('click', () => {
       model = (en==='clear') ? '' : label;
       drawModel();
+      if(en!=='clear') animText.value = label;   // chip also loads the writer
     });
     chips.appendChild(b);
   });
+
+  // ---- 運筆再生 · auto-write from animCJK medians ------------------------
+  // Each median polyline is resampled and given TIMESTAMPS from a velocity
+  // profile chosen by its KanjiVG ending type. The synthetic samples then run
+  // through the exact same brush engine as hand strokes — so the animation
+  // inherits every bit of the ink physics: pressed entries, lift-decided
+  // 止め/払い endings, corner shoulders, pooling, kasure.
+  const animText = document.getElementById('animText');
+  const btnWrite = document.getElementById('btnWrite');
+  const animNote = document.getElementById('animNote');
+  const NOTE_DEFAULT = animNote.innerHTML;
+  let animData=null, animRun=0;
+  const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+  function cancelAutoWrite(){
+    animRun++;
+    sizeOverride=null;
+    btnWrite.classList.remove('on');
+    btnWrite.textContent='▶ 書く';
+  }
+
+  async function loadAnimData(){
+    if(animData) return animData;
+    try{
+      const [m,t] = await Promise.all([
+        fetch('assets/data/medians.json').then(r=>{ if(!r.ok) throw 0; return r.json(); }),
+        fetch('assets/data/stroketypes.json').then(r=>r.ok?r.json():{}).catch(()=>({}))
+      ]);
+      animData={medians:m, types:t};
+      animNote.innerHTML=NOTE_DEFAULT;
+    }catch(e){
+      animNote.innerHTML='could not load <b>assets/data/…</b> — the writer needs the page served over http: run <b>python3 -m http.server</b> in the project folder and open localhost.';
+    }
+    return animData;
+  }
+
+  const polyLen = poly => { let l=0; for(let i=1;i<poly.length;i++) l+=Math.hypot(poly[i][0]-poly[i-1][0], poly[i][1]-poly[i-1][1]); return l; };
+
+  // ending type when KanjiVG has none (kana): a long tail run reads as a
+  // sweep (taper off), anything short or hooked stops (tome).
+  function guessType(poly){
+    const L=polyLen(poly);
+    if(L < 26*DPR) return 4;                       // 点
+    const k=Math.max(2, Math.floor(poly.length*0.25));
+    return polyLen(poly.slice(-k)) > 0.22*L ? 2 : 0;
+  }
+
+  // velocity multiplier along the stroke, per ending type
+  // 0 止め: settle to a stop · 1 はね: late flick · 2/3 払い: long accelerating
+  // sweep · 4 点: short and gentle
+  function speedProfile(type, s){
+    if(type===4) return 0.25 + 0.5*Math.sin(Math.PI*s);
+    if(type===1) return 0.32 + 0.55*Math.sin(Math.PI*s) + 1.8*Math.pow(smoothstep((s-0.78)/0.22),2);
+    if(type===2||type===3) return 0.32 + 0.55*Math.sin(Math.PI*s) + 1.5*Math.pow(smoothstep((s-0.55)/0.45),2);
+    return 0.30 + 0.80*Math.sin(Math.PI*s);
+  }
+
+  function synthesizeStroke(poly, type, cellCss){
+    // resample evenly (device px)
+    const step=Math.max(2.2*DPR, polyLen(poly)/140);
+    const rs=[[poly[0][0],poly[0][1]]];
+    for(let i=1;i<poly.length;i++){
+      let [ax,ay]=rs[rs.length-1];
+      const bx=poly[i][0], by=poly[i][1];
+      let d=Math.hypot(bx-ax,by-ay);
+      while(d>=step){
+        const f=step/d;
+        ax+=(bx-ax)*f; ay+=(by-ay)*f;
+        rs.push([ax,ay]);
+        d=Math.hypot(bx-ax,by-ay);
+      }
+    }
+    const lastR=rs[rs.length-1], lastP=poly[poly.length-1];
+    if(Math.hypot(lastP[0]-lastR[0], lastP[1]-lastR[1])>0.5) rs.push([lastP[0],lastP[1]]);
+    // timestamps from the velocity profile (natural pace; playback rate is
+    // applied at the clock so speed does not change stroke width)
+    const total=polyLen(rs)||1;
+    const vmax=cellCss/900;                        // css px/ms cruise
+    const out=[]; let t=0, acc=0;
+    for(let i=0;i<rs.length;i++){
+      if(i>0){
+        const d=Math.hypot(rs[i][0]-rs[i-1][0], rs[i][1]-rs[i-1][1]);
+        acc+=d;
+        const v=Math.max(0.05, speedProfile(type, acc/total))*vmax;
+        t+=d/(v*DPR);
+      }
+      out.push({x:rs[i][0], y:rs[i][1], p:0, t});
+    }
+    return out;
+  }
+
+  function animateStroke(strokePts, run){
+    return new Promise(res=>{
+      seed=(Math.random()*1e6)|0;                  // stable grain for this stroke
+      const t0=performance.now();
+      const tick=()=>{
+        if(animRun!==run){ res(); return; }
+        const t=(performance.now()-t0)*(P.aspeed||1);
+        let k=strokePts.length;
+        for(let i=0;i<strokePts.length;i++){ if(strokePts[i].t>t){ k=i; break; } }
+        if(k>=strokePts.length){
+          clearWet(); renderStroke(wctx, strokePts, true); commitWet();
+          res();
+        }else{
+          if(k>=2){ clearWet(); renderStroke(wctx, strokePts.slice(0,k), false); }
+          requestAnimationFrame(tick);
+        }
+      };
+      requestAnimationFrame(tick);
+    });
+  }
+
+  async function playAutoWrite(){
+    const data=await loadAnimData(); if(!data) return;
+    const wanted=[...(animText.value||'永')].filter(ch=>!/\s/.test(ch)).slice(0,4);
+    const found=wanted.filter(ch=>data.medians[ch]);
+    const missing=wanted.filter(ch=>!data.medians[ch]);
+    animNote.innerHTML = missing.length
+      ? `no stroke data for: <b>${missing.join(' ')}</b>${found.length?'':' — nothing to write'}`
+      : NOTE_DEFAULT;
+    if(!found.length) return;
+    const run=++animRun;
+    btnWrite.classList.add('on'); btnWrite.textContent='■ 停止';
+    // fresh sheet
+    pushUndo(); ictx.clearRect(0,0,W,H); clearWet();
+    model=''; drawModel();
+    hint.style.opacity=0;
+    const N=found.length;
+    const cellH=H/N, cell=Math.min(cellH,W), margin=0.10;
+    const scale=cell*(1-margin*2)/1024;
+    const cellCss=cell/DPR;
+    for(let ci=0;ci<N && animRun===run; ci++){
+      const g=data.medians[found[ci]];
+      // brush size fits the cell; sparse characters take a slightly fuller brush
+      sizeOverride=clamp(cellCss*0.055*clamp(Math.pow(10/((g.n||8)+4),0.3),0.7,1.1), 5, 48);
+      const types=data.types[found[ci]];
+      const ox=(W-1024*scale)/2, oy=cellH*ci+(cellH-1024*scale)/2;
+      for(let si=0; si<g.m.length && animRun===run; si++){
+        const poly=g.m[si].map(([x,y])=>[ox+x*scale, oy+y*scale]);
+        const type=(types && types[si]!=null) ? types[si] : guessType(poly);
+        await animateStroke(synthesizeStroke(poly, type, cellCss), run);
+        if(animRun===run) await sleep(110/(P.aspeed||1));
+      }
+      if(animRun===run && ci<N-1) await sleep(240/(P.aspeed||1));
+    }
+    if(animRun===run){
+      cancelAutoWrite();
+      strokeCount++; stamp.hidden=false;
+    }
+  }
+
+  btnWrite.addEventListener('click', () => {
+    if(btnWrite.classList.contains('on')) cancelAutoWrite();
+    else playAutoWrite();
+  });
+  animText.addEventListener('keydown', e => { if(e.key==='Enter') { cancelAutoWrite(); playAutoWrite(); } });
 
   // ---- paper buttons ----
   document.getElementById('undo').addEventListener('click', () => {
@@ -723,6 +902,7 @@
     if(undoStack.length===0){ stamp.hidden = true; strokeCount=0; }
   });
   document.getElementById('clear').addEventListener('click', () => {
+    cancelAutoWrite();
     pushUndo();
     ictx.clearRect(0,0,W,H);
     clearWet();

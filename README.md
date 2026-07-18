@@ -42,11 +42,17 @@ by hand — drag on the washi with a mouse, finger, or stylus and it renders liv
 sumi ink. Stroke width follows your speed (and stylus pressure when available):
 press slow for a fat wet line, flick fast for a thin 掠れ dry tail. It has ink-load,
 dry-brush and bleed controls, a 田 guide grid, ghost **手本** model characters to
-trace (永 水 山 …), undo/clear, and PNG export with a red seal. No data files or
-server needed — open it directly in a browser:
+trace (永 水 山 …), undo/clear, and PNG export with a red seal.
+
+It also has a **運筆再生 auto-writer**: type up to four characters and the brush
+writes them itself in correct stroke order — medians from the bundled animCJK
+data, per-stroke endings (止め/はね/払い/点) from KanjiVG, laid out 縦書き. The
+synthetic strokes run through the same brush engine as hand strokes, so the
+animation gets the full ink physics. Freehand drawing works from `file://`, but
+the auto-writer fetches `assets/data/*.json`, so serve over http for that:
 
 ```
-open brush-demo.html      # or just double-click it
+python3 -m http.server 8000    # then open localhost:8000/brush-demo.html
 ```
 
 ## What works (V1)
