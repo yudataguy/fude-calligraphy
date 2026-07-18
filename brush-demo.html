@@ -169,7 +169,7 @@
         <button id="btnWrite" style="flex:0 0 auto">▶ 書く</button>
       </div>
       <div class="ctl"><label><span><span class="ja">速さ</span> <span class="en">playback</span></span><span class="val" id="vAspeed"></span></label><input type="range" id="aspeed" min="0.3" max="2.5" step="0.05" value="1"></div>
-      <div class="note" id="animNote">The brush writes the characters itself, in correct stroke order — medians from <b>animCJK</b>, per-stroke endings from KanjiVG. Every character is written with a fresh <b>hand</b> (its own slant, size, pressure, tremor) and the ink drifts and re-dips as it goes, so the same word never looks twice-the-same. Up to 4 characters, 縦書き. Needs the page served over http for the data files.</div>
+      <div class="note" id="animNote">The brush writes the characters itself, in correct stroke order — medians from <b>animCJK</b>, per-stroke endings from KanjiVG. Each sheet is written by <b>one hand</b> — a writer's slant, pressure and pace are set per run, every character wobbles naturally around that style, and the ink drifts and re-dips as it goes — so repeats never match, yet the page stays one person's writing. Up to 4 characters, 縦書き. Needs the page served over http for the data files.</div>
     </div>
 
     <div class="group">
@@ -892,19 +892,34 @@
     const scale=cell*(1-margin*2)/1024;
     const cellCss=cell/DPR;
     let inkLevel=1;                                 // brush charge, drifts as it writes
+    // 書き手 ONE writer per sheet: the personal style — slant, size, pressure,
+    // pace, steadiness — is sampled once per run and held for every character.
+    // Characters then wobble only slightly around that style, plus a slow
+    // random-walk drift down the sheet, so repeated characters stay distinct
+    // but the page reads as one person's hand, not a different writer per cell.
+    const rnd=(a,b)=>a+(b-a)*Math.random();
+    const writer={
+      rot:rnd(-0.04,0.04), sc:rnd(0.96,1.04), shear:rnd(-0.05,0.05),
+      press:rnd(0.93,1.09), inkBias:rnd(0.94,1.04),
+      vBias:rnd(0.93,1.09), tremor:cellCss*rnd(0.004,0.008)
+    };
+    const drift={rot:0, sc:0, press:0};
     for(let ci=0;ci<N && animRun===run; ci++){
       const g=data.medians[found[ci]];
       const types=data.types[found[ci]];
       const baseSize=clamp(cellCss*0.055*clamp(Math.pow(10/((g.n||8)+4),0.3),0.7,1.1), 5, 48);
-      // 手癖 per-character hand: this instance's posture. A real hand never
-      // lands the same character twice — so even repeated words differ in
-      // stance, size, slant and pressure, not just surface grain.
-      const rnd=(a,b)=>a+(b-a)*Math.random();
+      // the hand wanders a little as the sheet goes on (bounded random walk)
+      drift.rot  =clamp(drift.rot  +rnd(-0.008,0.008), -0.02, 0.02);
+      drift.sc   =clamp(drift.sc   +rnd(-0.010,0.010), -0.025,0.025);
+      drift.press=clamp(drift.press+rnd(-0.020,0.020), -0.05, 0.05);
+      // this character = writer's style + drift + a small per-character wobble
       const H_={
-        rot:rnd(-0.05,0.05), sc:rnd(0.94,1.05), shear:rnd(-0.06,0.06),
-        jx:rnd(-0.045,0.045)*cell, jy:rnd(-0.035,0.035)*cell,
-        press:rnd(0.9,1.12),                       // overall width bias
-        inkBias:rnd(0.92,1.06), tremor:cellCss*0.006
+        rot:  writer.rot+drift.rot+rnd(-0.012,0.012),
+        sc:   writer.sc +drift.sc +rnd(-0.02,0.02),
+        shear:writer.shear+rnd(-0.015,0.015),
+        jx:rnd(-0.03,0.03)*cell, jy:rnd(-0.025,0.025)*cell,
+        press:writer.press+drift.press+rnd(-0.03,0.03),
+        inkBias:writer.inkBias*rnd(0.98,1.03), tremor:writer.tremor
       };
       const cx0=(W-1024*scale)/2+512*scale, cy0=cellH*ci+(cellH-1024*scale)/2+512*scale;
       const co=Math.cos(H_.rot), si_=Math.sin(H_.rot);
@@ -916,14 +931,15 @@
       for(let si=0; si<g.m.length && animRun===run; si++){
         const poly=g.m[si].map(place);
         const type=(types && types[si]!=null) ? types[si] : guessType(poly);
-        // per-stroke variation: pressure (width) and pace jitter
-        sizeOverride=clamp(baseSize*H_.press*rnd(0.88,1.13), 4, 52);
+        // per-stroke variation: pressure (width) and pace jitter — small,
+        // around the writer's own baseline
+        sizeOverride=clamp(baseSize*H_.press*rnd(0.94,1.08), 4, 52);
         // ink drifts down as the brush unloads, and darkness/dryness follow;
         // occasional re-dip reloads it — some characters come out wet & black,
         // others dry, exactly like writing several in one breath.
         inkOverride=clamp(P.ink*H_.inkBias*(0.72+0.28*inkLevel), 0.4, 1);
         kasureOverride=clamp(P.kasure+(1-inkLevel)*0.45, 0, 1);
-        await animateStroke(synthesizeStroke(poly, type, cellCss, {tremor:H_.tremor, vBias:rnd(0.9,1.12)}), run);
+        await animateStroke(synthesizeStroke(poly, type, cellCss, {tremor:H_.tremor, vBias:writer.vBias*rnd(0.95,1.07)}), run);
         inkLevel-=polyLen(poly)/(cell*7.5);
         if(inkLevel<0.4){ inkLevel=1; if(animRun===run) await sleep(160/(P.aspeed||1)); } // 墨継ぎ re-dip
         if(animRun===run) await sleep(110/(P.aspeed||1));
