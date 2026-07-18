@@ -35,6 +35,20 @@ The initial view can be set from the URL:
 
 e.g. `http://localhost:8000/?q=水&n=1`
 
+## Freehand brush demo
+
+`brush-demo.html` is a **standalone, dependency-free** page for *writing* Japanese
+by hand — drag on the washi with a mouse, finger, or stylus and it renders live
+sumi ink. Stroke width follows your speed (and stylus pressure when available):
+press slow for a fat wet line, flick fast for a thin 掠れ dry tail. It has ink-load,
+dry-brush and bleed controls, a 田 guide grid, ghost **手本** model characters to
+trace (永 水 山 …), undo/clear, and PNG export with a red seal. No data files or
+server needed — open it directly in a browser:
+
+```
+open brush-demo.html      # or just double-click it
+```
+
 ## What works (V1)
 
 - **F1** 用筆 controls — 提按 pressure, 中鋒↔側鋒 tip, 蔵鋒↔露鋒 entry, 墨量 ink-load,
