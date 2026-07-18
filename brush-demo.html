@@ -48,6 +48,7 @@
   .scroll{
     position:relative;width:min(78vh,100%);aspect-ratio:1/1;
     background:
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='p'><feTurbulence type='fractalNoise' baseFrequency='0.72' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='matrix' values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.05 0'/></filter><rect width='100%25' height='100%25' filter='url(%23p)'/></svg>"),
       radial-gradient(140% 120% at 50% 0%, #f6efdd, var(--washi) 55%, #e4dabf 100%);
     box-shadow:0 1px 0 #fffaf0 inset, 0 26px 60px -28px #000, 0 0 0 1px #000;
     border-radius:2px;overflow:hidden;
@@ -284,6 +285,24 @@
     return [ (n>>16)&255, (n>>8)&255, n&255 ];
   }
 
+  // ---- organic noise (stable per-stroke, so edges don't shimmer per frame) ----
+  let seed = 1;
+  function vhash(i, ch){
+    let n = (Math.imul(i|0, 374761393) ^ Math.imul(ch|0, 2246822519) ^ Math.imul(seed, 668265263)) | 0;
+    n = Math.imul(n ^ (n>>>13), 1274126177);
+    return (((n ^ (n>>>16)) >>> 0) / 4294967295) * 2 - 1;   // -1..1
+  }
+  // smooth value noise of a continuous coordinate, on channel ch
+  function vnoise(x, ch){
+    const xi = Math.floor(x), xf = x - xi, u = xf*xf*(3-2*xf);
+    return vhash(xi, ch)*(1-u) + vhash(xi+1, ch)*u;
+  }
+  // two-octave fibre noise as a function of arc-length d
+  function fibre(d, ch){
+    const wl = 12*DPR;
+    return vnoise(d/wl, ch)*0.62 + vnoise(d/(wl*0.4), ch+37)*0.38;
+  }
+
   function pointer(e){
     const rect = wet.getBoundingClientRect();
     return {
@@ -311,6 +330,7 @@
     wet.setPointerCapture?.(e.pointerId);
     pushUndo();
     drawing = true;
+    seed = (Math.random()*1e6)|0;   // fresh grain per stroke
     pts = [pointer(e)];
     schedule();
   }
@@ -352,14 +372,16 @@
 
   // Build a dense, smoothed centreline with a target half-width per sample.
   function buildSpine(src){
-    if(src.length===1){ const a=src[0]; return [{x:a.x,y:a.y,w:halfWidthAt(a,0),d:0}]; }
-    // per-source-point raw half-width from local speed
-    const rw=[];
+    if(src.length===1){ const a=src[0]; return [{x:a.x,y:a.y,w:halfWidthAt(a,0),d:0,spd:0}]; }
+    // per-source-point raw half-width + speed from local motion
+    const rw=[], spd=[];
     for(let i=0;i<src.length;i++){
       const a=src[Math.max(0,i-1)], b=src[i];
       const dist=Math.hypot(b.x-a.x,b.y-a.y);
       const dt=Math.max(1,(b.t||0)-(a.t||0));
-      rw.push(halfWidthAt(b, i===0?0:dist/dt));
+      const v=i===0?0:dist/dt;
+      spd.push(v);
+      rw.push(halfWidthAt(b, v));
     }
     // smooth widths (moving average)
     const sw=rw.map((_,i)=>{
@@ -376,8 +398,9 @@
         const t=s/steps;
         const pos=cr(P0(i-1),P0(i),P0(i+1),P0(i+2),t);
         const w=sw[i]+(sw[i+1]-sw[i])*t;
+        const v=spd[i]+(spd[i+1]-spd[i])*t;
         if(prev) acc+=Math.hypot(pos.x-prev.x,pos.y-prev.y);
-        out.push({x:pos.x,y:pos.y,w,d:acc});
+        out.push({x:pos.x,y:pos.y,w,d:acc,spd:v});
         prev=pos;
       }
     }
@@ -398,16 +421,26 @@
     }
   }
 
-  // render one stroke (spine -> filled variable-width ribbon + texture)
+  // unit normal at spine index i
+  function normalAt(spine,i){
+    const a=spine[Math.max(0,i-1)], c=spine[Math.min(spine.length-1,i+1)];
+    let tx=c.x-a.x, ty=c.y-a.y; const tl=Math.hypot(tx,ty)||1;
+    return {nx:-ty/tl, ny:tx/tl, tx:tx/tl, ty:ty/tl};
+  }
+
+  // render one stroke (spine -> filled variable-width ribbon + ink physics)
   function renderStroke(ctx, src, finalPass){
     if(!src.length) return;
     const spine=buildSpine(src);
     applyTapers(spine);
     const [r,g,b]=hexToRgb(P.color);
-    const alpha=P.ink;
+    const [wr,wg,wb]=hexToRgb('#efe7d3');       // washi, for lightening grain
+    const alpha=P.ink, dry=P.kasure;
 
     ctx.save();
     ctx.clearRect(0,0,W,H); // wet layer holds only this stroke
+    ctx.lineCap='round'; ctx.lineJoin='round';
+
     // single dot
     if(spine.length===1){
       const p=spine[0];
@@ -416,17 +449,24 @@
       ctx.restore(); return;
     }
 
-    // outline offsets
+    const total=spine[spine.length-1].d;
+    const avgW=spine.reduce((s,p)=>s+p.w,0)/spine.length;
+
+    // ragged, fibrous outline: perturb each side independently with fibre noise
+    // so the edge wavers like ink caught on paper tooth (not a vector curve).
+    // Roughness grows along the stroke — the loaded head stays smooth, the
+    // drying tail frays.
+    const baseRough=0.03 + dry*0.13;
     const L=[],R=[];
     for(let i=0;i<spine.length;i++){
-      const a=spine[Math.max(0,i-1)], c=spine[Math.min(spine.length-1,i+1)];
-      let tx=c.x-a.x, ty=c.y-a.y; const tl=Math.hypot(tx,ty)||1; tx/=tl; ty/=tl;
-      const nx=-ty, ny=tx, w=spine[i].w;
-      L.push({x:spine[i].x+nx*w, y:spine[i].y+ny*w});
-      R.push({x:spine[i].x-nx*w, y:spine[i].y-ny*w});
+      const {nx,ny}=normalAt(spine,i);
+      const p=spine[i], s=p.d/(total||1);
+      const rl=baseRough*(0.35+0.95*s);
+      const wl=Math.max(0.3, p.w*(1+rl*fibre(p.d,1)));
+      const wR=Math.max(0.3, p.w*(1+rl*fibre(p.d,2)));
+      L.push({x:p.x+nx*wl, y:p.y+ny*wl});
+      R.push({x:p.x-nx*wR, y:p.y-ny*wR});
     }
-
-    // soft feathered edge: a faint blurred underlay, then the crisp body
     const body=()=>{
       ctx.beginPath();
       ctx.moveTo(L[0].x,L[0].y);
@@ -434,43 +474,111 @@
       for(let i=R.length-1;i>=0;i--) ctx.lineTo(R[i].x,R[i].y);
       ctx.closePath();
     };
-    ctx.filter=`blur(${(1.1*DPR).toFixed(2)}px)`;
-    ctx.fillStyle=`rgba(${r},${g},${b},${alpha*0.5})`;
+    // faint blurred halo (wet edge feathering) + crisp body
+    ctx.filter=`blur(${(1.0*DPR).toFixed(2)}px)`;
+    ctx.fillStyle=`rgba(${r},${g},${b},${alpha*0.45})`;
     body(); ctx.fill();
     ctx.filter='none';
     ctx.fillStyle=`rgba(${r},${g},${b},${alpha})`;
     body(); ctx.fill();
 
-    // 掠れ dry-brush: carve individual bristle hairs OUT of the stroke, each
-    // running the full length (lengthwise), so paper shows between the hairs
-    // the way a splayed dry brush leaves streaks — not crosswise segments.
-    const dry=P.kasure;
+    // 墨継ぎ ink depletion: the brush unloads as it travels. Erode the ribbon
+    // progressively toward the tail so the head stays wet/black and the tail
+    // goes dry/broken — the biggest single "this is real ink" cue.
+    // 掠れ hairs run lengthwise; their bite grows with normalized position.
     if(dry>0.02 && spine.length>2){
       ctx.globalCompositeOperation='destination-out';
-      ctx.lineCap='round'; ctx.lineJoin='round';
-      const avgW=spine.reduce((s,p)=>s+p.w,0)/spine.length;
-      const hairs=Math.max(1,Math.round(avgW*0.55*(0.5+dry)));
+      const hairs=Math.max(2,Math.round(avgW*0.6*(0.5+dry)));
       for(let bi=0;bi<hairs;bi++){
-        const off=(Math.random()*2-1);            // lateral seat across the tuft
-        const erase=dry*(0.30+Math.random()*0.45); // how much this gap lifts
+        const off=(Math.random()*2-1);
+        const ch=10+bi;
         ctx.beginPath();
         for(let i=0;i<spine.length;i++){
-          const a=spine[Math.max(0,i-1)], c=spine[Math.min(spine.length-1,i+1)];
-          let tx=c.x-a.x, ty=c.y-a.y; const tl=Math.hypot(tx,ty)||1; tx/=tl; ty/=tl;
-          const nx=-ty, ny=tx, w=spine[i].w;
-          const x=spine[i].x+nx*off*w*0.86, y=spine[i].y+ny*off*w*0.86;
+          const {nx,ny}=normalAt(spine,i);
+          const p=spine[i];
+          const wob=0.10*p.w*vnoise(p.d/(9*DPR), ch);   // hairs waver too
+          const x=p.x+nx*(off*p.w*0.86+wob), y=p.y+ny*(off*p.w*0.86+wob);
           if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
         }
-        ctx.strokeStyle=`rgba(0,0,0,${erase})`;
-        ctx.lineWidth=Math.max(0.5, avgW*(0.06+Math.random()*0.10));
-        // mostly continuous, with occasional skips only when very dry
-        if(dry>0.55 && Math.random()<dry) ctx.setLineDash([ (18+Math.random()*40)*DPR, (2+Math.random()*4)*DPR ]);
-        else ctx.setLineDash([]);
+        // erase strength climbs toward the tail (depletion)
+        const s0=Math.random(), s1=0.55+Math.random()*0.45;      // this hair spans s0..s1 of the stroke
+        ctx.strokeStyle=`rgba(0,0,0,${dry*(0.22+Math.random()*0.4)})`;
+        ctx.lineWidth=Math.max(0.5, avgW*(0.05+Math.random()*0.09));
+        // dashes: dense long ink runs near the wet head, breaking up toward the dry tail
+        const gap=(1.5 + dry*14*s1)*DPR, run=(30 - dry*22)*DPR + Math.random()*20*DPR;
+        ctx.setLineDash(dry>0.25 ? [Math.max(4*DPR,run), Math.max(1,gap)] : []);
+        ctx.lineDashOffset=-s0*200*DPR;
         ctx.stroke();
       }
-      ctx.setLineDash([]);
+      // extra tail erosion: a soft wedge that lifts ink over the last stretch
+      const tailFrom=0.62;
+      for(let i=0;i<spine.length;i++){
+        const p=spine[i], s=p.d/total;
+        if(s<tailFrom) continue;
+        const k=smoothstep((s-tailFrom)/(1-tailFrom))*dry;
+        if(k<=0.02) continue;
+        const {nx,ny}=normalAt(spine,i);
+        for(let j=0;j<2;j++){
+          const o=(Math.random()*2-1)*p.w;
+          ctx.globalAlpha=k*(0.25+Math.random()*0.4);
+          ctx.beginPath();
+          ctx.arc(p.x+nx*o, p.y+ny*o, Math.max(0.6,p.w*(0.14+Math.random()*0.2)),0,Math.PI*2);
+          ctx.fillStyle='#000'; ctx.fill();
+        }
+      }
+      ctx.globalAlpha=1;
+      ctx.setLineDash([]); ctx.lineDashOffset=0;
       ctx.globalCompositeOperation='source-over';
     }
+
+    // 溜まり pooling: where the brush slows or turns hard, ink gathers darker.
+    ctx.globalCompositeOperation='source-over';
+    let prevDir=null;
+    for(let i=0;i<spine.length;i++){
+      const p=spine[i], {tx,ty}=normalAt(spine,i);
+      let turn=0;
+      if(prevDir) turn=Math.acos(clamp(tx*prevDir.tx+ty*prevDir.ty,-1,1));
+      prevDir={tx,ty};
+      const slow=clamp(1 - p.spd*6, 0, 1);                 // near-still
+      const bend=smoothstep((turn-0.22)/0.7);
+      const head=i<spine.length*0.14 ? 0.5 : 0;            // loaded-brush bloom at 起筆
+      const pool=Math.max(slow*0.45, bend*0.8, head);
+      if(pool<0.14 || i%2) continue;
+      const rad=p.w*(0.7+pool*0.9);
+      const grd=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,rad);
+      const a=alpha*pool*0.5;
+      grd.addColorStop(0,`rgba(${r},${g},${b},${a})`);
+      grd.addColorStop(1,`rgba(${r},${g},${b},0)`);
+      ctx.fillStyle=grd;
+      ctx.beginPath(); ctx.arc(p.x,p.y,rad,0,Math.PI*2); ctx.fill();
+    }
+
+    // granulation: sumi sits unevenly in the paper fibres. Mottle within the
+    // stroke only (source-atop), lightening random flecks + a few pinholes.
+    if(finalPass){
+      ctx.globalCompositeOperation='source-atop';
+      for(let i=0;i<spine.length;i++){
+        const p=spine[i], {nx,ny}=normalAt(spine,i), s=p.d/(total||1);
+        if(Math.random()>0.55+0.4*s) continue;   // sparser at the wet head
+        const o=(Math.random()*2-1)*p.w*0.9;
+        const rr=(0.5+Math.random()*1.4)*DPR;
+        ctx.fillStyle=`rgba(${wr},${wg},${wb},${0.035+Math.random()*0.09})`;
+        ctx.beginPath(); ctx.arc(p.x+nx*o,p.y+ny*o,rr,0,Math.PI*2); ctx.fill();
+      }
+      ctx.globalCompositeOperation='destination-out';
+      for(let i=0;i<spine.length;i++){
+        if(Math.random()<0.4){
+          const p=spine[i], {nx,ny}=normalAt(spine,i);
+          const o=(Math.random()*2-1)*p.w*0.85;
+          ctx.globalAlpha=0.06+Math.random()*0.12;
+          ctx.beginPath(); ctx.arc(p.x+nx*o,p.y+ny*o,(0.4+Math.random())*DPR,0,Math.PI*2);
+          ctx.fillStyle='#000'; ctx.fill();
+        }
+      }
+      ctx.globalAlpha=1;
+      ctx.globalCompositeOperation='source-over';
+    }
+
     ctx.restore();
   }
 
