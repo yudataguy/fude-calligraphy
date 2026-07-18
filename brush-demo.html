@@ -336,10 +336,11 @@
   // brush size in css px — the auto-writer overrides it to fit its cells.
   // ink/kasure can also be overridden per stroke so the writer can vary
   // darkness and dryness character-to-character (see the humaniser).
-  let sizeOverride = null, inkOverride = null, kasureOverride = null;
+  let sizeOverride = null, inkOverride = null, kasureOverride = null, bleedOverride = null;
   const brushSize = () => sizeOverride ?? P.size;
   const inkAmt   = () => inkOverride ?? P.ink;
   const kasureAmt= () => kasureOverride ?? P.kasure;
+  const bleedAmt = () => bleedOverride ?? P.bleed;
 
   // half-width the brush wants at a sample, from stroke size, pressure & speed.
   // Real kaisho has dramatic 提按 thick-thin: dwelling presses the tuft open
@@ -700,13 +701,14 @@
 
   // feather the finished stroke into the washi, then commit to the ink layer
   function commitWet(){
-    if(P.bleed>0){
+    const bl=bleedAmt();
+    if(bl>0){
       try{
         const tmp=document.createElement('canvas'); tmp.width=W; tmp.height=H;
         const t=tmp.getContext('2d');
-        t.filter=`blur(${(0.8+P.bleed*3.2).toFixed(2)}px)`;
+        t.filter=`blur(${(0.8+bl*3.2).toFixed(2)}px)`;
         t.drawImage(wet,0,0);
-        ictx.globalAlpha=0.12+P.bleed*0.26;
+        ictx.globalAlpha=0.12+bl*0.26;
         ictx.drawImage(tmp,0,0);
         ictx.globalAlpha=1;
       }catch(e){}
@@ -757,7 +759,7 @@
 
   function cancelAutoWrite(){
     animRun++;
-    sizeOverride=inkOverride=kasureOverride=null;
+    sizeOverride=inkOverride=kasureOverride=bleedOverride=null;
     btnWrite.classList.remove('on');
     btnWrite.textContent='▶ 書く';
   }
@@ -907,7 +909,11 @@
     for(let ci=0;ci<N && animRun===run; ci++){
       const g=data.medians[found[ci]];
       const types=data.types[found[ci]];
-      const baseSize=clamp(cellCss*0.055*clamp(Math.pow(10/((g.n||8)+4),0.3),0.7,1.1), 5, 48);
+      // dense characters take a finer brush (and tighter bleed) so crowded
+      // components like the 心 in 愛 stay articulated instead of flooding
+      const nStrokes=g.n||8;
+      const baseSize=clamp(cellCss*0.05*clamp(Math.pow(10/(nStrokes+4),0.45),0.55,1.15), 4, 44);
+      bleedOverride=clamp(P.bleed*Math.min(1, 8/(nStrokes+4)), 0, 1);
       // the hand wanders a little as the sheet goes on (bounded random walk)
       drift.rot  =clamp(drift.rot  +rnd(-0.008,0.008), -0.02, 0.02);
       drift.sc   =clamp(drift.sc   +rnd(-0.010,0.010), -0.025,0.025);
