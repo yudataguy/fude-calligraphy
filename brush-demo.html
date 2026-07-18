@@ -124,7 +124,7 @@
 <header>
   <div class="glyph">手習い · tenarai</div>
   <h1>Write Japanese with an <em>ink brush</em> — right in the browser</h1>
-  <p>Drag on the paper with a mouse, finger, or stylus. The stroke width follows your speed and pressure the way real 筆 does — press slow for a fat wet line, flick fast for a thin dry tail. Ink bleeds into the washi at rest, and dry-brush 掠れ streaks appear when you move quickly.</p>
+  <p>Drag on the paper with a mouse, finger, or stylus. The brush behaves like real 筆 — dwell to press the tuft open, sweep to ride the tip. <b>How you lift decides the ending:</b> stop dead and the stroke ends in a rounded 止め; flick off and it tapers to a dry 払い point. Corners swell like a pressed 折れ, and the stroke bulges to the brush-belly side the way kaisho does.</p>
 </header>
 <main>
   <div class="stage">
@@ -140,7 +140,7 @@
     <div class="group">
       <div class="gh">運筆 · the brush</div>
       <div class="ctl"><label><span><span class="ja">太さ</span> <span class="en">size</span></span><span class="val" id="vSize"></span></label><input type="range" id="size" min="8" max="64" step="1" value="30"></div>
-      <div class="ctl"><label><span><span class="ja">墨量</span> <span class="en">ink load</span></span><span class="val" id="vInk"></span></label><input type="range" id="inkload" min="0.3" max="1" step="0.01" value="0.9"></div>
+      <div class="ctl"><label><span><span class="ja">墨量</span> <span class="en">ink load</span></span><span class="val" id="vInk"></span></label><input type="range" id="inkload" min="0.3" max="1" step="0.01" value="0.96"></div>
       <div class="ctl"><label><span><span class="ja">掠れ</span> <span class="en">dry brush</span></span><span class="val" id="vKasure"></span></label><input type="range" id="kasure" min="0" max="1" step="0.01" value="0.4"></div>
       <div class="ctl"><label><span><span class="ja">にじみ</span> <span class="en">bleed</span></span><span class="val" id="vBleed"></span></label><input type="range" id="bleed" min="0" max="1" step="0.01" value="0.3"></div>
     </div>
@@ -316,11 +316,13 @@
   const clamp = (v,a,b)=>v<a?a:v>b?b:v;
   const smoothstep = t => { t=clamp(t,0,1); return t*t*(3-2*t); };
 
-  // half-width the brush wants at a sample, from stroke size, pressure & speed
+  // half-width the brush wants at a sample, from stroke size, pressure & speed.
+  // Real kaisho has dramatic 提按 thick-thin: dwelling presses the tuft open
+  // (>1x), a fast sweep rides the tip (~0.15x).
   function halfWidthAt(pt, speed){
     const s = P.size*DPR*0.5;
-    const speedFactor = clamp(1 - speed*0.14, 0.20, 1); // px/ms -> fast = thin
-    const press = pt.p>0 ? (0.4 + pt.p*0.9) : 1;
+    const speedFactor = clamp(1.18 - speed*0.34, 0.14, 1.18);
+    const press = pt.p>0 ? (0.35 + pt.p*1.0) : 1;
     return Math.max(0.5, s*speedFactor*press);
   }
 
@@ -407,18 +409,42 @@
     return out;
   }
 
-  // taper the ends to a point so strokes read as 筆, not tubes
-  function applyTapers(spine){
+  // Shape the ends the way the brush actually lands and leaves.
+  // 起筆: the brush is pressed onto the paper already loaded — the head starts
+  // wide (an angled cap is stamped over it later), it does NOT grow from a point.
+  // 収筆: how you LIFT decides the ending — stop dead = 止め (rounded, keeps
+  // width), sweep off fast = 払い/はね (long taper to a needle point).
+  function applyTapers(spine, lift){
     if(spine.length<2) return;
     const total=spine[spine.length-1].d;
     const base=P.size*DPR;
-    const headLen=clamp(base*0.9, 6*DPR, total*0.45);  // 起筆: soft entry
-    const tailLen=clamp(base*1.7, 8*DPR, total*0.7);   // 収筆: long pointed exit
+    const headLen=clamp(base*0.55, 4*DPR, total*0.35);
+    const tailLen=clamp(base*(0.5+lift*2.4), 6*DPR, total*0.78);
+    const tailFloor=(1-lift)*0.92;             // tome keeps its width, harai -> 0
     for(const p of spine){
-      const head=0.25+0.75*smoothstep(p.d/headLen);      // never fully zero at start
-      const tail=smoothstep((total-p.d)/tailLen);        // -> 0 at the very end
+      const head=0.62+0.38*smoothstep(p.d/headLen);
+      const tRaw=smoothstep((total-p.d)/tailLen);
+      const tail=tailFloor+(1-tailFloor)*tRaw;
       p.w=Math.max(0.4, p.w*head*tail);
     }
+  }
+
+  // 折れ corner shoulders: pressing through a hard turn splays the tuft, so
+  // real strokes swell at the corner instead of bending at constant width.
+  function applyShoulders(spine){
+    if(spine.length<7) return;
+    const mult=new Array(spine.length).fill(1);
+    for(let i=3;i<spine.length-3;i++){
+      const a=normalAt(spine,i-3), b=normalAt(spine,i+3);
+      const turn=Math.acos(clamp(a.tx*b.tx+a.ty*b.ty,-1,1));
+      if(turn<0.4) continue;
+      const k=smoothstep((turn-0.4)/1.1)*0.4;
+      for(let j=i-4;j<=i+4;j++){
+        if(j<0||j>=spine.length) continue;
+        mult[j]=Math.max(mult[j], 1+k*(1-Math.abs(j-i)/5));
+      }
+    }
+    for(let i=0;i<spine.length;i++) spine[i].w*=mult[i];
   }
 
   // unit normal at spine index i
@@ -432,7 +458,15 @@
   function renderStroke(ctx, src, finalPass){
     if(!src.length) return;
     const spine=buildSpine(src);
-    applyTapers(spine);
+    // lift speed (avg over the last few samples) decides 止め vs 払い
+    let lift=0;
+    if(spine.length>3){
+      let s=0,n=0;
+      for(let i=Math.max(0,spine.length-6);i<spine.length;i++){ s+=spine[i].spd; n++; }
+      lift=clamp((s/n)*0.85, 0, 1);
+    }
+    applyTapers(spine, lift);
+    applyShoulders(spine);
     const [r,g,b]=hexToRgb(P.color);
     const [wr,wg,wb]=hexToRgb('#efe7d3');       // washi, for lightening grain
     const alpha=P.ink, dry=P.kasure;
@@ -455,18 +489,32 @@
     // ragged, fibrous outline: perturb each side independently with fibre noise
     // so the edge wavers like ink caught on paper tooth (not a vector curve).
     // Roughness grows along the stroke — the loaded head stays smooth, the
-    // drying tail frays.
-    const baseRough=0.03 + dry*0.13;
-    const L=[],R=[];
+    // drying tail frays. The brush BELLY rides one side of the tip's path
+    // (the nib is held at a fixed angle), so the ribbon bulges down/right the
+    // way kaisho strokes do, instead of being a symmetric tube.
+    const baseRough=0.025 + dry*0.11;
+    const bellyX=Math.cos(0.9), bellyY=Math.sin(0.9);  // belly points down-right
+    // precompute per-point geometry: smoothed tangent/normal, belly-shifted
+    // centre, per-side widths, and local bend (used to calm hairs at corners)
+    const geo=[];
     for(let i=0;i<spine.length;i++){
-      const {nx,ny}=normalAt(spine,i);
+      const a=spine[Math.max(0,i-2)], c=spine[Math.min(spine.length-1,i+2)];
+      let tx=c.x-a.x, ty=c.y-a.y; const tl=Math.hypot(tx,ty)||1; tx/=tl; ty/=tl;
+      const nx=-ty, ny=tx;
       const p=spine[i], s=p.d/(total||1);
-      const rl=baseRough*(0.35+0.95*s);
-      const wl=Math.max(0.3, p.w*(1+rl*fibre(p.d,1)));
-      const wR=Math.max(0.3, p.w*(1+rl*fibre(p.d,2)));
-      L.push({x:p.x+nx*wl, y:p.y+ny*wl});
-      R.push({x:p.x-nx*wR, y:p.y-ny*wR});
+      const rl=baseRough*(0.3+1.0*s);
+      const belly=nx*bellyX+ny*bellyY;
+      const shift=0.20*p.w*belly;                      // centre drifts toward the belly
+      const f=normalAt(spine,Math.max(0,i-3)), h=normalAt(spine,Math.min(spine.length-1,i+3));
+      const bend=smoothstep((Math.acos(clamp(f.tx*h.tx+f.ty*h.ty,-1,1))-0.3)/1.0);
+      geo.push({
+        cx:p.x+nx*shift, cy:p.y+ny*shift, nx,ny,tx,ty, bend,
+        wl:Math.max(0.3, p.w*(1+0.28*belly)*(1+rl*fibre(p.d,1))),
+        wr:Math.max(0.3, p.w*(1-0.28*belly)*(1+rl*fibre(p.d,2)))
+      });
     }
+    const L=geo.map(q=>({x:q.cx+q.nx*q.wl, y:q.cy+q.ny*q.wl}));
+    const R=geo.map(q=>({x:q.cx-q.nx*q.wr, y:q.cy-q.ny*q.wr}));
     const body=()=>{
       ctx.beginPath();
       ctx.moveTo(L[0].x,L[0].y);
@@ -474,13 +522,45 @@
       for(let i=R.length-1;i>=0;i--) ctx.lineTo(R[i].x,R[i].y);
       ctx.closePath();
     };
-    // faint blurred halo (wet edge feathering) + crisp body
-    ctx.filter=`blur(${(1.0*DPR).toFixed(2)}px)`;
-    ctx.fillStyle=`rgba(${r},${g},${b},${alpha*0.45})`;
-    body(); ctx.fill();
+    // caps are drawn at the belly-shifted centres and inset along the stroke,
+    // so they merge into the ink mass instead of reading as stuck-on blobs.
+    const caps=()=>{
+      // 起筆 angled press: beveled entry lozenge, inset along the stroke
+      const q0=geo[0], h=spine[0];
+      const a0=Math.atan2(q0.ty,q0.tx);
+      ctx.beginPath();
+      ctx.ellipse(q0.cx+q0.tx*h.w*0.30, q0.cy+q0.ty*h.w*0.30,
+                  Math.max(1,h.w*1.12), Math.max(0.8,h.w*0.74), a0+0.55, 0, Math.PI*2);
+      ctx.fill();
+      // 止め pressed ending: stopping before the lift leaves a rounded press
+      if(lift<0.55){
+        const qN=geo[geo.length-1], e=spine[spine.length-1];
+        const aN=Math.atan2(qN.ty,qN.tx), k=1-lift/0.55;
+        ctx.beginPath();
+        ctx.ellipse(qN.cx-qN.tx*e.w*0.22, qN.cy-qN.ty*e.w*0.22,
+                    Math.max(1,e.w*(0.95+0.2*k)), Math.max(0.8,e.w*(0.88+0.1*k)), aN+0.25*k, 0, Math.PI*2);
+        ctx.fill();
+      }
+    };
+    // at a pressed corner the offset outline can pinch; the real tuft simply
+    // covers the elbow — patch discs over high-bend points
+    const elbows=()=>{
+      for(let i=2;i<geo.length-2;i+=2){
+        const q=geo[i];
+        if(q.bend<0.45) continue;
+        ctx.beginPath();
+        ctx.arc(q.cx,q.cy, Math.max(1,spine[i].w*1.02), 0, Math.PI*2);
+        ctx.fill();
+      }
+    };
+    // tight wet halo + a double-filled body so the ink reads dense black
+    ctx.filter=`blur(${(0.7*DPR).toFixed(2)}px)`;
+    ctx.fillStyle=`rgba(${r},${g},${b},${alpha*0.35})`;
+    body(); ctx.fill(); caps(); elbows();
     ctx.filter='none';
     ctx.fillStyle=`rgba(${r},${g},${b},${alpha})`;
-    body(); ctx.fill();
+    body(); ctx.fill(); caps(); elbows();
+    body(); ctx.fill(); caps(); elbows();
 
     // 墨継ぎ ink depletion: the brush unloads as it travels. Erode the ribbon
     // progressively toward the tail so the head stays wet/black and the tail
@@ -488,34 +568,43 @@
     // 掠れ hairs run lengthwise; their bite grows with normalized position.
     if(dry>0.02 && spine.length>2){
       ctx.globalCompositeOperation='destination-out';
-      const hairs=Math.max(2,Math.round(avgW*0.6*(0.5+dry)));
+      // each hair's erasure fades in along the stroke (gradient head->tail),
+      // so the loaded head stays SOLID BLACK and only the far end streaks.
+      const h0=spine[0], hN=spine[spine.length-1];
+      const hairs=Math.max(2,Math.round(avgW*0.5*(0.5+dry)));
       for(let bi=0;bi<hairs;bi++){
         const off=(Math.random()*2-1);
         const ch=10+bi;
         ctx.beginPath();
         for(let i=0;i<spine.length;i++){
-          const {nx,ny}=normalAt(spine,i);
-          const p=spine[i];
+          const q=geo[i], p=spine[i];
           const wob=0.10*p.w*vnoise(p.d/(9*DPR), ch);   // hairs waver too
-          const x=p.x+nx*(off*p.w*0.86+wob), y=p.y+ny*(off*p.w*0.86+wob);
+          // at a pressed corner the tuft is squeezed together — pull the hair
+          // toward the centreline so it can't slash across the inside of a bend
+          const o=off*(1-0.8*q.bend);
+          const x=q.cx+q.nx*(o*p.w*0.86+wob), y=q.cy+q.ny*(o*p.w*0.86+wob);
           if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
         }
-        // erase strength climbs toward the tail (depletion)
-        const s0=Math.random(), s1=0.55+Math.random()*0.45;      // this hair spans s0..s1 of the stroke
-        ctx.strokeStyle=`rgba(0,0,0,${dry*(0.22+Math.random()*0.4)})`;
+        const peak=dry*(0.3+Math.random()*0.45)*(0.35+0.65*lift);
+        const grad=ctx.createLinearGradient(h0.x,h0.y,hN.x,hN.y);
+        grad.addColorStop(0, 'rgba(0,0,0,0)');
+        grad.addColorStop(0.45+Math.random()*0.15, `rgba(0,0,0,${(peak*0.25).toFixed(3)})`);
+        grad.addColorStop(1, `rgba(0,0,0,${peak.toFixed(3)})`);
+        ctx.strokeStyle=grad;
         ctx.lineWidth=Math.max(0.5, avgW*(0.05+Math.random()*0.09));
-        // dashes: dense long ink runs near the wet head, breaking up toward the dry tail
-        const gap=(1.5 + dry*14*s1)*DPR, run=(30 - dry*22)*DPR + Math.random()*20*DPR;
-        ctx.setLineDash(dry>0.25 ? [Math.max(4*DPR,run), Math.max(1,gap)] : []);
-        ctx.lineDashOffset=-s0*200*DPR;
+        const gap=(1.5 + dry*12)*DPR, run=(26 - dry*16)*DPR + Math.random()*18*DPR;
+        ctx.setLineDash(dry>0.3 ? [Math.max(4*DPR,run), Math.max(1,gap)] : []);
+        ctx.lineDashOffset=-Math.random()*200*DPR;
         ctx.stroke();
       }
-      // extra tail erosion: a soft wedge that lifts ink over the last stretch
-      const tailFrom=0.62;
-      for(let i=0;i<spine.length;i++){
+      // tail erosion wedge — only when the brush actually swept off (払い);
+      // a stopped 止め ending stays wet and full.
+      const tailFrom=0.7;
+      const sweep=dry*lift;
+      if(sweep>0.04) for(let i=0;i<spine.length;i++){
         const p=spine[i], s=p.d/total;
         if(s<tailFrom) continue;
-        const k=smoothstep((s-tailFrom)/(1-tailFrom))*dry;
+        const k=smoothstep((s-tailFrom)/(1-tailFrom))*sweep;
         if(k<=0.02) continue;
         const {nx,ny}=normalAt(spine,i);
         for(let j=0;j<2;j++){
@@ -541,7 +630,7 @@
       prevDir={tx,ty};
       const slow=clamp(1 - p.spd*6, 0, 1);                 // near-still
       const bend=smoothstep((turn-0.22)/0.7);
-      const head=i<spine.length*0.14 ? 0.5 : 0;            // loaded-brush bloom at 起筆
+      const head=i<spine.length*0.08 ? 0.3 : 0;            // slight wet bloom at 起筆
       const pool=Math.max(slow*0.45, bend*0.8, head);
       if(pool<0.14 || i%2) continue;
       const rad=p.w*(0.7+pool*0.9);
@@ -559,18 +648,19 @@
       ctx.globalCompositeOperation='source-atop';
       for(let i=0;i<spine.length;i++){
         const p=spine[i], {nx,ny}=normalAt(spine,i), s=p.d/(total||1);
-        if(Math.random()>0.55+0.4*s) continue;   // sparser at the wet head
+        if(s<0.35 || Math.random()>0.25+0.45*s) continue;  // wet head stays solid
         const o=(Math.random()*2-1)*p.w*0.9;
-        const rr=(0.5+Math.random()*1.4)*DPR;
-        ctx.fillStyle=`rgba(${wr},${wg},${wb},${0.035+Math.random()*0.09})`;
+        const rr=(0.5+Math.random()*1.2)*DPR;
+        ctx.fillStyle=`rgba(${wr},${wg},${wb},${0.03+Math.random()*0.07})`;
         ctx.beginPath(); ctx.arc(p.x+nx*o,p.y+ny*o,rr,0,Math.PI*2); ctx.fill();
       }
       ctx.globalCompositeOperation='destination-out';
       for(let i=0;i<spine.length;i++){
-        if(Math.random()<0.4){
+        const s=spine[i].d/(total||1);
+        if(s>0.45 && Math.random()<0.25){
           const p=spine[i], {nx,ny}=normalAt(spine,i);
           const o=(Math.random()*2-1)*p.w*0.85;
-          ctx.globalAlpha=0.06+Math.random()*0.12;
+          ctx.globalAlpha=(0.04+Math.random()*0.10)*s;
           ctx.beginPath(); ctx.arc(p.x+nx*o,p.y+ny*o,(0.4+Math.random())*DPR,0,Math.PI*2);
           ctx.fillStyle='#000'; ctx.fill();
         }
