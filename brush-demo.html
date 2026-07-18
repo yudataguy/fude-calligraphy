@@ -169,7 +169,7 @@
         <button id="btnWrite" style="flex:0 0 auto">▶ 書く</button>
       </div>
       <div class="ctl"><label><span><span class="ja">速さ</span> <span class="en">playback</span></span><span class="val" id="vAspeed"></span></label><input type="range" id="aspeed" min="0.3" max="2.5" step="0.05" value="1"></div>
-      <div class="note" id="animNote">The brush writes the characters itself, in correct stroke order — medians from <b>animCJK</b>, per-stroke endings from KanjiVG. Up to 4 characters, laid out 縦書き. Needs the page served over http for the data files.</div>
+      <div class="note" id="animNote">The brush writes the characters itself, in correct stroke order — medians from <b>animCJK</b>, per-stroke endings from KanjiVG. Every character is written with a fresh <b>hand</b> (its own slant, size, pressure, tremor) and the ink drifts and re-dips as it goes, so the same word never looks twice-the-same. Up to 4 characters, 縦書き. Needs the page served over http for the data files.</div>
     </div>
 
     <div class="group">
@@ -333,9 +333,13 @@
   const clamp = (v,a,b)=>v<a?a:v>b?b:v;
   const smoothstep = t => { t=clamp(t,0,1); return t*t*(3-2*t); };
 
-  // brush size in css px — the auto-writer overrides it to fit its cells
-  let sizeOverride = null;
+  // brush size in css px — the auto-writer overrides it to fit its cells.
+  // ink/kasure can also be overridden per stroke so the writer can vary
+  // darkness and dryness character-to-character (see the humaniser).
+  let sizeOverride = null, inkOverride = null, kasureOverride = null;
   const brushSize = () => sizeOverride ?? P.size;
+  const inkAmt   = () => inkOverride ?? P.ink;
+  const kasureAmt= () => kasureOverride ?? P.kasure;
 
   // half-width the brush wants at a sample, from stroke size, pressure & speed.
   // Real kaisho has dramatic 提按 thick-thin: dwelling presses the tuft open
@@ -491,7 +495,7 @@
     applyShoulders(spine);
     const [r,g,b]=hexToRgb(P.color);
     const [wr,wg,wb]=hexToRgb('#efe7d3');       // washi, for lightening grain
-    const alpha=P.ink, dry=P.kasure;
+    const alpha=inkAmt(), dry=kasureAmt();
 
     ctx.save();
     ctx.clearRect(0,0,W,H); // wet layer holds only this stroke
@@ -753,7 +757,7 @@
 
   function cancelAutoWrite(){
     animRun++;
-    sizeOverride=null;
+    sizeOverride=inkOverride=kasureOverride=null;
     btnWrite.classList.remove('on');
     btnWrite.textContent='▶ 書く';
   }
@@ -794,7 +798,8 @@
     return 0.30 + 0.80*Math.sin(Math.PI*s);
   }
 
-  function synthesizeStroke(poly, type, cellCss){
+  function synthesizeStroke(poly, type, cellCss, hand){
+    hand=hand||{};
     // resample evenly (device px)
     const step=Math.max(2.2*DPR, polyLen(poly)/140);
     const rs=[[poly[0][0],poly[0][1]]];
@@ -811,10 +816,28 @@
     }
     const lastR=rs[rs.length-1], lastP=poly[poly.length-1];
     if(Math.hypot(lastP[0]-lastR[0], lastP[1]-lastR[1])>0.5) rs.push([lastP[0],lastP[1]]);
+
+    // 手のふるえ hand tremor: a smooth low-frequency wobble perpendicular to
+    // the path — a real hand doesn't trace a perfect spline. Random-walk with
+    // decay gives a gentle waver rather than jitter, and the endpoints are
+    // pinned so the character still connects.
+    const tremor=(hand.tremor||0)*DPR;
+    if(tremor>0 && rs.length>4){
+      let off=0; const offs=[];
+      for(let i=0;i<rs.length;i++){ off=off*0.86+(Math.random()*2-1)*tremor*0.16; offs.push(off); }
+      for(let i=1;i<rs.length-1;i++){
+        const a=rs[i-1], c=rs[i+1];
+        let tx=c[0]-a[0], ty=c[1]-a[1]; const tl=Math.hypot(tx,ty)||1; tx/=tl; ty/=tl;
+        const taper=Math.sin(Math.PI*i/(rs.length-1));   // 0 at ends, 1 mid
+        rs[i][0]+=-ty*offs[i]*taper; rs[i][1]+=tx*offs[i]*taper;
+      }
+    }
+
     // timestamps from the velocity profile (natural pace; playback rate is
-    // applied at the clock so speed does not change stroke width)
+    // applied at the clock so speed does not change stroke width). vBias/vAmp
+    // jitter the cruise pace per stroke so 提按 thick-thin falls differently.
     const total=polyLen(rs)||1;
-    const vmax=cellCss/900;                        // css px/ms cruise
+    const vmax=cellCss/900*(hand.vBias||1);        // css px/ms cruise
     const out=[]; let t=0, acc=0;
     for(let i=0;i<rs.length;i++){
       if(i>0){
@@ -868,16 +891,41 @@
     const cellH=H/N, cell=Math.min(cellH,W), margin=0.10;
     const scale=cell*(1-margin*2)/1024;
     const cellCss=cell/DPR;
+    let inkLevel=1;                                 // brush charge, drifts as it writes
     for(let ci=0;ci<N && animRun===run; ci++){
       const g=data.medians[found[ci]];
-      // brush size fits the cell; sparse characters take a slightly fuller brush
-      sizeOverride=clamp(cellCss*0.055*clamp(Math.pow(10/((g.n||8)+4),0.3),0.7,1.1), 5, 48);
       const types=data.types[found[ci]];
-      const ox=(W-1024*scale)/2, oy=cellH*ci+(cellH-1024*scale)/2;
+      const baseSize=clamp(cellCss*0.055*clamp(Math.pow(10/((g.n||8)+4),0.3),0.7,1.1), 5, 48);
+      // 手癖 per-character hand: this instance's posture. A real hand never
+      // lands the same character twice — so even repeated words differ in
+      // stance, size, slant and pressure, not just surface grain.
+      const rnd=(a,b)=>a+(b-a)*Math.random();
+      const H_={
+        rot:rnd(-0.05,0.05), sc:rnd(0.94,1.05), shear:rnd(-0.06,0.06),
+        jx:rnd(-0.045,0.045)*cell, jy:rnd(-0.035,0.035)*cell,
+        press:rnd(0.9,1.12),                       // overall width bias
+        inkBias:rnd(0.92,1.06), tremor:cellCss*0.006
+      };
+      const cx0=(W-1024*scale)/2+512*scale, cy0=cellH*ci+(cellH-1024*scale)/2+512*scale;
+      const co=Math.cos(H_.rot), si_=Math.sin(H_.rot);
+      const place=([x,y])=>{                        // glyph-space -> device, humanised
+        let dx=(x-512)*scale, dy=(y-512)*scale;     // relative to cell centre
+        dx*=H_.sc; dy*=H_.sc; dx+=H_.shear*dy;      // scale + slant
+        return [cx0+dx*co-dy*si_+H_.jx, cy0+dx*si_+dy*co+H_.jy];
+      };
       for(let si=0; si<g.m.length && animRun===run; si++){
-        const poly=g.m[si].map(([x,y])=>[ox+x*scale, oy+y*scale]);
+        const poly=g.m[si].map(place);
         const type=(types && types[si]!=null) ? types[si] : guessType(poly);
-        await animateStroke(synthesizeStroke(poly, type, cellCss), run);
+        // per-stroke variation: pressure (width) and pace jitter
+        sizeOverride=clamp(baseSize*H_.press*rnd(0.88,1.13), 4, 52);
+        // ink drifts down as the brush unloads, and darkness/dryness follow;
+        // occasional re-dip reloads it — some characters come out wet & black,
+        // others dry, exactly like writing several in one breath.
+        inkOverride=clamp(P.ink*H_.inkBias*(0.72+0.28*inkLevel), 0.4, 1);
+        kasureOverride=clamp(P.kasure+(1-inkLevel)*0.45, 0, 1);
+        await animateStroke(synthesizeStroke(poly, type, cellCss, {tremor:H_.tremor, vBias:rnd(0.9,1.12)}), run);
+        inkLevel-=polyLen(poly)/(cell*7.5);
+        if(inkLevel<0.4){ inkLevel=1; if(animRun===run) await sleep(160/(P.aspeed||1)); } // 墨継ぎ re-dip
         if(animRun===run) await sleep(110/(P.aspeed||1));
       }
       if(animRun===run && ci<N-1) await sleep(240/(P.aspeed||1));
